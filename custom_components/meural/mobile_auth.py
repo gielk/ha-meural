@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import html
 import json
 import logging
@@ -35,6 +36,8 @@ AUTH_CALLBACK_NAME = "api:meural:mobile-auth"
 MOBILE_AUTH_TIMEOUT = 10 * 60
 
 _DATA_SESSIONS = "_mobile_auth_sessions"
+_DATA_COMPLETED_SESSIONS = "_mobile_auth_completed_sessions"
+_DATA_SESSION_LOCKS = "_mobile_auth_session_locks"
 _DATA_VIEW_REGISTERED = "_mobile_auth_view_registered"
 
 
@@ -63,10 +66,18 @@ def create_mobile_auth_url(
     """
     domain_data = hass.data.setdefault(DOMAIN, {})
     sessions: dict[str, MobileAuthSession] = domain_data.setdefault(_DATA_SESSIONS, {})
+    completed_sessions: dict[str, MobileAuthSession] = domain_data.setdefault(
+        _DATA_COMPLETED_SESSIONS, {}
+    )
+    session_locks: dict[str, asyncio.Lock] = domain_data.setdefault(
+        _DATA_SESSION_LOCKS, {}
+    )
     now = time.monotonic()
-    for state, session in list(sessions.items()):
-        if session.expires_at <= now:
-            sessions.pop(state, None)
+    for collection in (sessions, completed_sessions):
+        for state, session in list(collection.items()):
+            if session.expires_at <= now:
+                collection.pop(state, None)
+                session_locks.pop(state, None)
 
     if not domain_data.get(_DATA_VIEW_REGISTERED):
         hass.http.register_view(MeuralMobileAuthView())
@@ -102,11 +113,18 @@ class MeuralMobileAuthView(HomeAssistantView):
 
     async def get(self, request: web.Request, flow_id: str) -> web.Response:
         """Serve the self-contained mobile login page."""
-        session = self._get_session(request, flow_id)
+        session, completed = self._get_session(request, flow_id)
         if session is None:
             return self._error_page(
                 "This mobile sign-in link is invalid or has expired.",
                 status=web.HTTPGone.status_code,
+            )
+
+        if completed:
+            return self._error_page(
+                "This sign-in has already been sent to Home Assistant. You can "
+                "close this page.",
+                status=web.HTTPOk.status_code,
             )
 
         nonce = secrets.token_urlsafe(24)
@@ -119,7 +137,7 @@ class MeuralMobileAuthView(HomeAssistantView):
 
     async def post(self, request: web.Request, flow_id: str) -> web.Response:
         """Pass a Cognito result back into the waiting config flow."""
-        session = self._get_session(request, flow_id)
+        session, completed = self._get_session(request, flow_id)
         if session is None:
             return web.json_response(
                 {"error": "This mobile sign-in link is invalid or has expired."},
@@ -134,6 +152,12 @@ class MeuralMobileAuthView(HomeAssistantView):
             return web.json_response(
                 {"error": "The sign-in response came from an unexpected origin."},
                 status=web.HTTPForbidden.status_code,
+                headers={"Cache-Control": "no-store"},
+            )
+
+        if completed:
+            return web.json_response(
+                {"status": "ok", "already_completed": True},
                 headers={"Cache-Control": "no-store"},
             )
 
@@ -168,33 +192,59 @@ class MeuralMobileAuthView(HomeAssistantView):
             )
 
         hass: HomeAssistant = request.app[KEY_HASS]
-        sessions: dict[str, MobileAuthSession] = hass.data[DOMAIN][_DATA_SESSIONS]
-        sessions.pop(session.state, None)
+        domain_data = hass.data[DOMAIN]
+        locks: dict[str, asyncio.Lock] = domain_data[_DATA_SESSION_LOCKS]
+        lock = locks.setdefault(session.state, asyncio.Lock())
+        async with lock:
+            # A previous request may have completed while this one waited for the
+            # lock. Treat the retry as success so a lost HTTP response is harmless.
+            current_session, completed = self._get_session(request, flow_id)
+            if current_session is None:
+                return web.json_response(
+                    {"error": "This mobile sign-in link is invalid or has expired."},
+                    status=web.HTTPGone.status_code,
+                    headers={"Cache-Control": "no-store"},
+                )
+            if completed:
+                return web.json_response(
+                    {"status": "ok", "already_completed": True},
+                    headers={"Cache-Control": "no-store"},
+                )
 
-        try:
-            result = await hass.config_entries.flow.async_configure(
-                flow_id=flow_id,
-                user_input=validated,
-            )
-        except Exception:  # pylint: disable=broad-except
-            _LOGGER.exception("Meural: Could not resume the mobile sign-in flow")
-            return web.json_response(
-                {"error": "Home Assistant could not resume the sign-in flow."},
-                status=web.HTTPBadRequest.status_code,
-                headers={"Cache-Control": "no-store"},
-            )
+            try:
+                result = await hass.config_entries.flow.async_configure(
+                    flow_id=flow_id,
+                    user_input=validated,
+                )
+            except Exception:  # pylint: disable=broad-except
+                # Keep the session pending: the browser can retry after restoring
+                # its connection to Home Assistant.
+                _LOGGER.exception("Meural: Could not resume the mobile sign-in flow")
+                return web.json_response(
+                    {"error": "Home Assistant could not resume the sign-in flow."},
+                    status=web.HTTPBadRequest.status_code,
+                    headers={"Cache-Control": "no-store"},
+                )
 
-        if result["type"] is not FlowResultType.EXTERNAL_STEP_DONE:
-            _LOGGER.debug(
-                "Meural: Mobile sign-in flow was no longer active when the "
-                "browser handoff arrived"
-            )
-            return web.json_response(
-                {"error": "The Home Assistant sign-in flow is no longer active."},
-                status=web.HTTPBadRequest.status_code,
-                headers={"Cache-Control": "no-store"},
-            )
+            if result["type"] is not FlowResultType.EXTERNAL_STEP_DONE:
+                _LOGGER.debug(
+                    "Meural: Mobile sign-in flow was no longer active when the "
+                    "browser handoff arrived"
+                )
+                return web.json_response(
+                    {"error": "The Home Assistant sign-in flow is no longer active."},
+                    status=web.HTTPBadRequest.status_code,
+                    headers={"Cache-Control": "no-store"},
+                )
 
+            sessions: dict[str, MobileAuthSession] = domain_data[_DATA_SESSIONS]
+            completed_sessions: dict[str, MobileAuthSession] = domain_data[
+                _DATA_COMPLETED_SESSIONS
+            ]
+            sessions.pop(session.state, None)
+            completed_sessions[session.state] = session
+
+        locks.pop(session.state, None)
         _LOGGER.debug("Meural: Mobile sign-in handoff delivered to Home Assistant")
         return web.json_response(
             {"status": "ok"},
@@ -205,14 +255,20 @@ class MeuralMobileAuthView(HomeAssistantView):
     def _get_session(
         request: web.Request,
         flow_id: str,
-    ) -> MobileAuthSession | None:
-        """Return a live session matching both unguessable state and flow ID."""
+    ) -> tuple[MobileAuthSession | None, bool]:
+        """Return a live session and whether its handoff already completed."""
         hass: HomeAssistant = request.app[KEY_HASS]
         state = request.query.get("state", "")
-        sessions: dict[str, MobileAuthSession] = hass.data.get(DOMAIN, {}).get(
-            _DATA_SESSIONS, {}
+        domain_data = hass.data.get(DOMAIN, {})
+        sessions: dict[str, MobileAuthSession] = domain_data.get(_DATA_SESSIONS, {})
+        completed_sessions: dict[str, MobileAuthSession] = domain_data.get(
+            _DATA_COMPLETED_SESSIONS, {}
         )
         session = sessions.get(state)
+        completed = False
+        if session is None:
+            session = completed_sessions.get(state)
+            completed = session is not None
         if (
             session is None
             or not secrets.compare_digest(session.flow_id, flow_id)
@@ -221,8 +277,10 @@ class MeuralMobileAuthView(HomeAssistantView):
             _LOGGER.debug("Meural: Mobile sign-in session is invalid or expired")
             if session is not None:
                 sessions.pop(state, None)
-            return None
-        return session
+                completed_sessions.pop(state, None)
+                domain_data.get(_DATA_SESSION_LOCKS, {}).pop(state, None)
+            return None, False
+        return session, completed
 
     @staticmethod
     def _error_page(message: str, status: int) -> web.Response:
@@ -329,7 +387,7 @@ def _mobile_login_html(nonce: str, trust_id: str | None) -> str:
               border-radius: 999px; background: #e36f4f; color: #fff;
               font: inherit; font-weight: 700; }}
     button:disabled {{ opacity: .55; }}
-    #code-form, #done {{ display: none; }}
+    #code-form, #handoff, #done {{ display: none; }}
     #status {{ min-height: 1.5em; margin-top: 18px; }}
     .hint {{ font-size: .92rem; color: #5f6368; }}
     .error {{ color: #b3261e; }}
@@ -344,7 +402,7 @@ def _mobile_login_html(nonce: str, trust_id: str | None) -> str:
 <main>
   <section id="login">
     <h1>Sign in to Meural</h1>
-    <p>Turn Wi-Fi off before continuing so NETGEAR receives this sign-in from your mobile connection.</p>
+    <p>Keep this page open, then turn Wi-Fi off before signing in so NETGEAR receives the request from your mobile connection.</p>
     <p class="hint">Your email, password, and verification code are sent directly from this browser to NETGEAR. Home Assistant receives only a temporary sign-in token.</p>
     <form id="login-form">
       <label>Email<input id="email" name="email" type="email" autocomplete="username" maxlength="320" required></label>
@@ -356,6 +414,14 @@ def _mobile_login_html(nonce: str, trust_id: str | None) -> str:
       <button id="code-button" type="submit">Verify</button>
     </form>
     <p id="status" role="status" aria-live="polite"></p>
+  </section>
+  <section id="handoff">
+    <h1>NETGEAR sign-in succeeded</h1>
+    <p>The sign-in result now needs to be sent to Home Assistant.</p>
+    <p><strong>Reconnect to your home Wi-Fi or VPN, keep this tab open, then press the button below.</strong></p>
+    <button id="handoff-button" type="button">Send to Home Assistant</button>
+    <p id="handoff-status" role="status" aria-live="polite"></p>
+    <p class="hint">The result stays only in this open tab and the link expires after 10 minutes.</p>
   </section>
   <section id="done">
     <h1>Sign-in sent</h1>
@@ -374,16 +440,21 @@ const WAF_BLOCK_PAGE_KEYWORDS = {waf_block_page_keywords};
 const USER_MIGRATION_KEYWORDS = {user_migration_keywords};
 const loginForm = document.getElementById("login-form");
 const codeForm = document.getElementById("code-form");
+const handoffSection = document.getElementById("handoff");
 const loginButton = document.getElementById("login-button");
 const codeButton = document.getElementById("code-button");
+const handoffButton = document.getElementById("handoff-button");
 const emailInput = document.getElementById("email");
 const passwordInput = document.getElementById("password");
 const codeInput = document.getElementById("code");
 const statusNode = document.getElementById("status");
+const handoffStatusNode = document.getElementById("handoff-status");
 let currentEmail = "";
 let currentPassword = "";
 let trustId = "";
 let pending = null;
+let pendingHandoff = null;
+let handoffInProgress = false;
 
 function setStatus(message, isError = false) {{
   statusNode.textContent = message;
@@ -400,6 +471,62 @@ function clearSecrets() {{
   passwordInput.value = "";
   codeInput.value = "";
   pending = null;
+}}
+
+function setHandoffStatus(message, isError = false) {{
+  handoffStatusNode.textContent = message;
+  handoffStatusNode.className = isError ? "error" : "";
+}}
+
+function showHandoff(message, canRetry = true) {{
+  document.getElementById("login").style.display = "none";
+  handoffSection.style.display = "block";
+  setHandoffStatus(message, true);
+  handoffButton.disabled = !canRetry;
+}}
+
+async function sendHandoff() {{
+  if (!pendingHandoff || handoffInProgress) return;
+  handoffInProgress = true;
+  handoffButton.disabled = true;
+  document.getElementById("login").style.display = "none";
+  handoffSection.style.display = "block";
+  setHandoffStatus("Sending the sign-in result to Home Assistant…");
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 15000);
+  try {{
+    const response = await fetch(window.location.pathname + window.location.search, {{
+      method: "POST",
+      credentials: "same-origin",
+      cache: "no-store",
+      headers: {{ "Content-Type": "application/json" }},
+      body: JSON.stringify(pendingHandoff),
+      signal: controller.signal
+    }});
+    let result = {{}};
+    try {{ result = await response.json(); }} catch (error) {{ /* No response body. */ }}
+    if (!response.ok) {{
+      if (response.status === 410) {{
+        pendingHandoff = null;
+        throw new Error("This sign-in link expired. Return to Home Assistant and start again.");
+      }}
+      throw new Error(String(result.error || "Home Assistant rejected the sign-in result."));
+    }}
+    pendingHandoff = null;
+    clearSecrets();
+    handoffSection.style.display = "none";
+    document.getElementById("done").style.display = "block";
+  }} catch (error) {{
+    if (pendingHandoff) {{
+      showHandoff("Reconnect to your home Wi-Fi or VPN, then try sending again.");
+    }} else {{
+      showHandoff(String(error.message || "The sign-in result could not be sent."), false);
+    }}
+  }} finally {{
+    clearTimeout(timeout);
+    handoffInProgress = false;
+    if (pendingHandoff) handoffButton.disabled = false;
+  }}
 }}
 
 function newTrustId() {{
@@ -507,23 +634,16 @@ async function processResponse(response, attempt = 0) {{
   if (typeof accessToken !== "string" || accessToken.length < 100) {{
     throw new Error("NETGEAR did not return a usable sign-in token.");
   }}
-  setStatus("Sending the sign-in result to Home Assistant…");
-  const handoff = await fetch(window.location.pathname + window.location.search, {{
-    method: "POST",
-    credentials: "same-origin",
-    cache: "no-store",
-    headers: {{ "Content-Type": "application/json" }},
-    body: JSON.stringify({{
-      email: currentEmail,
-      cognito_access_token: accessToken,
-      trust_id: trustId
-    }})
-  }});
-  const result = await handoff.json();
-  if (!handoff.ok) throw new Error(String(result.error || "Home Assistant rejected the sign-in result."));
-  clearSecrets();
-  document.getElementById("login").style.display = "none";
-  document.getElementById("done").style.display = "block";
+  pendingHandoff = {{
+    email: currentEmail,
+    cognito_access_token: accessToken,
+    trust_id: trustId
+  }};
+  currentPassword = "";
+  passwordInput.value = "";
+  codeInput.value = "";
+  pending = null;
+  await sendHandoff();
 }}
 
 function isWafError(error) {{
@@ -561,6 +681,15 @@ codeForm.addEventListener("submit", async (event) => {{
   setStatus("Checking the verification code…");
   try {{ await processResponse(await respond(challenge, codeInput.value.trim()), challenge.attempt); }}
   catch (error) {{ pending = challenge; showFailure(error); }}
+}});
+
+handoffButton.addEventListener("click", sendHandoff);
+
+window.addEventListener("pagehide", () => {{
+  clearSecrets();
+  pendingHandoff = null;
+  currentEmail = "";
+  trustId = "";
 }});
 </script>
 </body>
