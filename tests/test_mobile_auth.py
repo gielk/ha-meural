@@ -108,7 +108,12 @@ class FakeFlowManager:
         outcome = self.outcomes.pop(0)
         if isinstance(outcome, Exception):
             raise outcome
-        self.current = outcome
+        # Home Assistant's public async_get() returns only flow identity and
+        # current step, not the full FlowResult (including its type).
+        self.current = {
+            "handler": outcome["handler"],
+            "step_id": outcome["step_id"],
+        }
         return outcome
 
     def async_get(self, flow_id: str):
@@ -123,7 +128,7 @@ class FakeBus:
     def __init__(self) -> None:
         self.events = []
 
-    def async_fire_internal(self, event_type: str, data: dict) -> None:
+    def async_fire(self, event_type: str, data: dict) -> None:
         self.events.append((event_type, data))
 
 
@@ -222,17 +227,13 @@ class MobileAuthHandoffTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("notified again", response.text)
         self.assertEqual(events_before_get + 1, len(hass.bus.events))
 
-    async def test_refresh_stops_after_flow_advanced(self) -> None:
+    async def test_refresh_reports_removed_flow_as_advanced(self) -> None:
         hass = FakeHass(_external_done())
         state, payload = _session(hass)
         view = mobile_auth.MeuralMobileAuthView()
         request = FakeRequest(hass, state, payload)
         await view.post(request, "flow-id")
-        hass.config_entries.flow.current = {
-            "type": FlowResultType.FORM,
-            "handler": "meural",
-            "step_id": "mobile_finish",
-        }
+        hass.config_entries.flow.current = None
         events_before_retry = len(hass.bus.events)
 
         response = await view.post(request, "flow-id")

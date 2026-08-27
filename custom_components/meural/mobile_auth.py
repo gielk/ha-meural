@@ -278,10 +278,10 @@ class MeuralMobileAuthView(HomeAssistantView):
         except UnknownFlow:
             return True
 
-        if result["type"] is not FlowResultType.EXTERNAL_STEP_DONE:
-            return True
-
-        hass.bus.async_fire_internal(
+        # `async_get` deliberately returns only the flow identity and current
+        # step, so do not inspect a non-existent result type here. A refresh is
+        # only sent after the browser has already delivered this session.
+        hass.bus.async_fire(
             EVENT_DATA_ENTRY_FLOW_PROGRESSED,
             {
                 "handler": result["handler"],

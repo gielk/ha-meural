@@ -5,6 +5,12 @@ All notable changes to the ha-meural Home Assistant integration will be document
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.5.1-beta.3] - 2026-08-27
+
+### Fixed
+- Fixed a 500 response when refreshing a completed mobile sign-in: Home Assistant's public flow lookup does not include a result `type`, so the refresh notification now uses only the documented flow identity and step data.
+- Use Home Assistant's public event bus method for the reconnect notification, compatible with Home Assistant 2026.8.
+
 ## [2.5.1-beta.2] - 2026-08-27
 
 ### Fixed
