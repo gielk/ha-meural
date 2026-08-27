@@ -39,7 +39,7 @@ If NETGEAR sends a one-time verification code by email, SMS, or an authenticator
 3. Open the one-time link on the phone and keep that browser tab open.
 4. Turn off Wi-Fi or disconnect the VPN before entering the NETGEAR account details, so authentication uses mobile data.
 5. If the page cannot send the result back, reconnect to your home Wi-Fi or VPN and press **Send to Home Assistant** in the same browser tab.
-6. Return to Home Assistant to complete setup.
+6. Return to Home Assistant to complete setup. If its window still shows the external website step because it was offline when the notification arrived, return to the mobile page and press **Refresh Home Assistant**. Reopening the same one-time link from the waiting Home Assistant window also sends this refresh notification.
 
 The one-time link expires after 10 minutes. The account password and verification code are sent directly from the phone browser to NETGEAR Cognito; they are not sent back to or stored by Home Assistant. The short-lived Cognito result remains only in memory in the open browser tab until delivery succeeds, and is never displayed or stored in browser storage. Repeated delivery is safe if an HTTP response gets lost. If NETGEAR also blocks the final token exchange from the home IP, stop retrying and wait for NETGEAR support to remove the block.
 

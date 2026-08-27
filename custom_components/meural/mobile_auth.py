@@ -16,7 +16,11 @@ from urllib.parse import quote, urlsplit
 from aiohttp import web
 from homeassistant.components.http import KEY_HASS, HomeAssistantView
 from homeassistant.core import HomeAssistant
-from homeassistant.data_entry_flow import FlowResultType
+from homeassistant.data_entry_flow import (
+    EVENT_DATA_ENTRY_FLOW_PROGRESSED,
+    FlowResultType,
+    UnknownFlow,
+)
 
 from .const import DOMAIN
 from .netgear_auth import (
@@ -121,9 +125,10 @@ class MeuralMobileAuthView(HomeAssistantView):
             )
 
         if completed:
+            self._notify_frontend_if_waiting(request.app[KEY_HASS], session.flow_id)
             return self._error_page(
-                "This sign-in has already been sent to Home Assistant. You can "
-                "close this page.",
+                "This sign-in has already been sent. Home Assistant has been "
+                "notified again; return to its tab to continue.",
                 status=web.HTTPOk.status_code,
             )
 
@@ -156,8 +161,15 @@ class MeuralMobileAuthView(HomeAssistantView):
             )
 
         if completed:
+            flow_advanced = self._notify_frontend_if_waiting(
+                request.app[KEY_HASS], session.flow_id
+            )
             return web.json_response(
-                {"status": "ok", "already_completed": True},
+                {
+                    "status": "ok",
+                    "already_completed": True,
+                    "flow_advanced": flow_advanced,
+                },
                 headers={"Cache-Control": "no-store"},
             )
 
@@ -206,8 +218,15 @@ class MeuralMobileAuthView(HomeAssistantView):
                     headers={"Cache-Control": "no-store"},
                 )
             if completed:
+                flow_advanced = self._notify_frontend_if_waiting(
+                    hass, current_session.flow_id
+                )
                 return web.json_response(
-                    {"status": "ok", "already_completed": True},
+                    {
+                        "status": "ok",
+                        "already_completed": True,
+                        "flow_advanced": flow_advanced,
+                    },
                     headers={"Cache-Control": "no-store"},
                 )
 
@@ -247,9 +266,30 @@ class MeuralMobileAuthView(HomeAssistantView):
         locks.pop(session.state, None)
         _LOGGER.debug("Meural: Mobile sign-in handoff delivered to Home Assistant")
         return web.json_response(
-            {"status": "ok"},
+            {"status": "ok", "flow_advanced": False},
             headers={"Cache-Control": "no-store"},
         )
+
+    @staticmethod
+    def _notify_frontend_if_waiting(hass: HomeAssistant, flow_id: str) -> bool:
+        """Wake a reconnected frontend while the external step is still waiting."""
+        try:
+            result = hass.config_entries.flow.async_get(flow_id)
+        except UnknownFlow:
+            return True
+
+        if result["type"] is not FlowResultType.EXTERNAL_STEP_DONE:
+            return True
+
+        hass.bus.async_fire_internal(
+            EVENT_DATA_ENTRY_FLOW_PROGRESSED,
+            {
+                "handler": result["handler"],
+                "flow_id": flow_id,
+                "refresh": True,
+            },
+        )
+        return False
 
     @staticmethod
     def _get_session(
@@ -269,16 +309,21 @@ class MeuralMobileAuthView(HomeAssistantView):
         if session is None:
             session = completed_sessions.get(state)
             completed = session is not None
-        if (
-            session is None
-            or not secrets.compare_digest(session.flow_id, flow_id)
-            or session.expires_at <= time.monotonic()
-        ):
+        if session is None:
             _LOGGER.debug("Meural: Mobile sign-in session is invalid or expired")
-            if session is not None:
-                sessions.pop(state, None)
-                completed_sessions.pop(state, None)
-                domain_data.get(_DATA_SESSION_LOCKS, {}).pop(state, None)
+            return None, False
+
+        # A request with a guessed/malformed flow ID must never be able to remove
+        # the real session belonging to the unguessable state value.
+        if not secrets.compare_digest(session.flow_id, flow_id):
+            _LOGGER.debug("Meural: Mobile sign-in flow ID does not match its session")
+            return None, False
+
+        if session.expires_at <= time.monotonic():
+            _LOGGER.debug("Meural: Mobile sign-in session is invalid or expired")
+            sessions.pop(state, None)
+            completed_sessions.pop(state, None)
+            domain_data.get(_DATA_SESSION_LOCKS, {}).pop(state, None)
             return None, False
         return session, completed
 
@@ -425,7 +470,9 @@ def _mobile_login_html(nonce: str, trust_id: str | None) -> str:
   </section>
   <section id="done">
     <h1>Sign-in sent</h1>
-    <p>Return to Home Assistant to finish setting up Meural. You can close this page.</p>
+    <p id="done-status" role="status" aria-live="polite">Notifying the Home Assistant window…</p>
+    <button id="refresh-button" type="button">Refresh Home Assistant</button>
+    <p class="hint">If Home Assistant still shows the external website step, make sure its tab is connected and press this button.</p>
   </section>
 </main>
 <script nonce="{nonce}">
@@ -444,17 +491,21 @@ const handoffSection = document.getElementById("handoff");
 const loginButton = document.getElementById("login-button");
 const codeButton = document.getElementById("code-button");
 const handoffButton = document.getElementById("handoff-button");
+const refreshButton = document.getElementById("refresh-button");
 const emailInput = document.getElementById("email");
 const passwordInput = document.getElementById("password");
 const codeInput = document.getElementById("code");
 const statusNode = document.getElementById("status");
 const handoffStatusNode = document.getElementById("handoff-status");
+const doneStatusNode = document.getElementById("done-status");
 let currentEmail = "";
 let currentPassword = "";
 let trustId = "";
 let pending = null;
 let pendingHandoff = null;
 let handoffInProgress = false;
+let wakeInProgress = false;
+let wakeCancelled = false;
 
 function setStatus(message, isError = false) {{
   statusNode.textContent = message;
@@ -485,6 +536,30 @@ function showHandoff(message, canRetry = true) {{
   handoffButton.disabled = !canRetry;
 }}
 
+async function wakeHomeAssistant() {{
+  if (wakeInProgress || wakeCancelled) return false;
+  wakeInProgress = true;
+  refreshButton.disabled = true;
+  try {{
+    const response = await fetch(window.location.pathname + window.location.search, {{
+      method: "POST",
+      credentials: "same-origin",
+      cache: "no-store",
+      headers: {{ "Content-Type": "application/json" }},
+      body: "{{}}"
+    }});
+    let result = {{}};
+    try {{ result = await response.json(); }} catch (error) {{ /* No response body. */ }}
+    if (!response.ok || result.status !== "ok") {{
+      throw new Error(String(result.error || "Home Assistant could not be refreshed."));
+    }}
+    return result.flow_advanced === true;
+  }} finally {{
+    wakeInProgress = false;
+    refreshButton.disabled = false;
+  }}
+}}
+
 async function sendHandoff() {{
   if (!pendingHandoff || handoffInProgress) return;
   handoffInProgress = true;
@@ -512,10 +587,17 @@ async function sendHandoff() {{
       }}
       throw new Error(String(result.error || "Home Assistant rejected the sign-in result."));
     }}
+    if (result.status !== "ok") {{
+      throw new Error("Home Assistant returned an invalid sign-in response.");
+    }}
+    const flowAdvanced = result.flow_advanced === true;
     pendingHandoff = null;
     clearSecrets();
     handoffSection.style.display = "none";
     document.getElementById("done").style.display = "block";
+    doneStatusNode.textContent = flowAdvanced
+      ? "Home Assistant continued the setup. You can return to its tab."
+      : "Return to Home Assistant. If it still waits, come back and press Refresh Home Assistant.";
   }} catch (error) {{
     if (pendingHandoff) {{
       showHandoff("Reconnect to your home Wi-Fi or VPN, then try sending again.");
@@ -685,7 +767,20 @@ codeForm.addEventListener("submit", async (event) => {{
 
 handoffButton.addEventListener("click", sendHandoff);
 
+refreshButton.addEventListener("click", async () => {{
+  doneStatusNode.textContent = "Notifying Home Assistant again…";
+  try {{
+    const advanced = await wakeHomeAssistant();
+    doneStatusNode.textContent = advanced
+      ? "Home Assistant continued the setup. You can return to its tab."
+      : "Home Assistant was notified. Return to its tab; press again if it still waits.";
+  }} catch (error) {{
+    doneStatusNode.textContent = String(error.message || "Home Assistant could not be refreshed.");
+  }}
+}});
+
 window.addEventListener("pagehide", () => {{
+  wakeCancelled = true;
   clearSecrets();
   pendingHandoff = null;
   currentEmail = "";

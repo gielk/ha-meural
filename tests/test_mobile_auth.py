@@ -15,7 +15,12 @@ from urllib.parse import parse_qs, urlsplit
 class FlowResultType(Enum):
     """Minimal Home Assistant flow result type used by the view."""
 
-    EXTERNAL_STEP_DONE = "external_step_done"
+    EXTERNAL_STEP_DONE = "external_done"
+    FORM = "form"
+
+
+class UnknownFlow(Exception):
+    """Minimal Home Assistant unknown-flow exception."""
 
 
 class HomeAssistantView:
@@ -36,7 +41,9 @@ def _load_mobile_auth_module():
     core = types.ModuleType("homeassistant.core")
     core.HomeAssistant = object
     data_entry_flow = types.ModuleType("homeassistant.data_entry_flow")
+    data_entry_flow.EVENT_DATA_ENTRY_FLOW_PROGRESSED = "data_entry_flow_progressed"
     data_entry_flow.FlowResultType = FlowResultType
+    data_entry_flow.UnknownFlow = UnknownFlow
     sys.modules.update(
         {
             "homeassistant": homeassistant,
@@ -94,13 +101,30 @@ class FakeFlowManager:
     def __init__(self, *outcomes) -> None:
         self.outcomes = list(outcomes)
         self.calls = []
+        self.current = None
 
     async def async_configure(self, **kwargs):
         self.calls.append(kwargs)
         outcome = self.outcomes.pop(0)
         if isinstance(outcome, Exception):
             raise outcome
+        self.current = outcome
         return outcome
+
+    def async_get(self, flow_id: str):
+        if self.current is None:
+            raise UnknownFlow
+        return self.current
+
+
+class FakeBus:
+    """Capture internal Home Assistant flow progress events."""
+
+    def __init__(self) -> None:
+        self.events = []
+
+    def async_fire_internal(self, event_type: str, data: dict) -> None:
+        self.events.append((event_type, data))
 
 
 class FakeHass:
@@ -109,6 +133,7 @@ class FakeHass:
     def __init__(self, *outcomes) -> None:
         self.data = {}
         self.http = FakeHttp()
+        self.bus = FakeBus()
         self.config_entries = types.SimpleNamespace(flow=FakeFlowManager(*outcomes))
 
 
@@ -142,11 +167,19 @@ def _session(hass: FakeHass) -> tuple[str, dict[str, str]]:
     return state, payload
 
 
+def _external_done() -> dict:
+    return {
+        "type": FlowResultType.EXTERNAL_STEP_DONE,
+        "handler": "meural",
+        "step_id": "mobile_finish",
+    }
+
+
 class MobileAuthHandoffTest(unittest.IsolatedAsyncioTestCase):
     """Exercise retry and duplicate delivery behavior."""
 
     async def test_duplicate_delivery_is_idempotent(self) -> None:
-        hass = FakeHass({"type": FlowResultType.EXTERNAL_STEP_DONE})
+        hass = FakeHass(_external_done())
         state, payload = _session(hass)
         view = mobile_auth.MeuralMobileAuthView()
 
@@ -156,12 +189,14 @@ class MobileAuthHandoffTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(200, first.status)
         self.assertEqual(200, second.status)
         self.assertTrue(json.loads(second.text)["already_completed"])
+        self.assertFalse(json.loads(second.text)["flow_advanced"])
         self.assertEqual(1, len(hass.config_entries.flow.calls))
+        self.assertEqual(1, len(hass.bus.events))
 
     async def test_failed_handoff_can_be_retried(self) -> None:
         hass = FakeHass(
             RuntimeError("temporary failure"),
-            {"type": FlowResultType.EXTERNAL_STEP_DONE},
+            _external_done(),
         )
         state, payload = _session(hass)
         view = mobile_auth.MeuralMobileAuthView()
@@ -173,12 +208,61 @@ class MobileAuthHandoffTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(200, second.status)
         self.assertEqual(2, len(hass.config_entries.flow.calls))
 
+    async def test_completed_get_wakes_reconnected_frontend(self) -> None:
+        hass = FakeHass(_external_done())
+        state, payload = _session(hass)
+        view = mobile_auth.MeuralMobileAuthView()
+        request = FakeRequest(hass, state, payload)
+        await view.post(request, "flow-id")
+        events_before_get = len(hass.bus.events)
+
+        response = await view.get(request, "flow-id")
+
+        self.assertEqual(200, response.status)
+        self.assertIn("notified again", response.text)
+        self.assertEqual(events_before_get + 1, len(hass.bus.events))
+
+    async def test_refresh_stops_after_flow_advanced(self) -> None:
+        hass = FakeHass(_external_done())
+        state, payload = _session(hass)
+        view = mobile_auth.MeuralMobileAuthView()
+        request = FakeRequest(hass, state, payload)
+        await view.post(request, "flow-id")
+        hass.config_entries.flow.current = {
+            "type": FlowResultType.FORM,
+            "handler": "meural",
+            "step_id": "mobile_finish",
+        }
+        events_before_retry = len(hass.bus.events)
+
+        response = await view.post(request, "flow-id")
+
+        self.assertTrue(json.loads(response.text)["flow_advanced"])
+        self.assertEqual(events_before_retry, len(hass.bus.events))
+
+    def test_wrong_flow_id_does_not_remove_session(self) -> None:
+        hass = FakeHass(_external_done())
+        state, payload = _session(hass)
+        request = FakeRequest(hass, state, payload)
+
+        wrong, _ = mobile_auth.MeuralMobileAuthView._get_session(
+            request, "wrong-flow-id"
+        )
+        correct, _ = mobile_auth.MeuralMobileAuthView._get_session(
+            request, "flow-id"
+        )
+
+        self.assertIsNone(wrong)
+        self.assertIsNotNone(correct)
+
     def test_browser_keeps_result_only_in_open_tab(self) -> None:
         page = mobile_auth._mobile_login_html("nonce", None)
 
         self.assertIn("Reconnect to your home Wi-Fi or VPN", page)
         self.assertIn("Send to Home Assistant", page)
+        self.assertIn("Refresh Home Assistant", page)
         self.assertIn("pendingHandoff", page)
+        self.assertIn('result.status !== "ok"', page)
         self.assertNotIn("localStorage", page)
         self.assertNotIn("sessionStorage", page)
 
